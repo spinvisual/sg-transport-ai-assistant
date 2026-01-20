@@ -3,72 +3,89 @@ import pandas as pd
 from google.cloud import bigquery
 from dotenv import load_dotenv
 import os
+import time
 from datetime import datetime
 
-# 1. Load configuration from your .env file
 load_dotenv()
 
-# Setup Google Cloud Client
-# This automatically looks for the path in your GOOGLE_APPLICATION_CREDENTIALS .env variable
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "sg-transport-key.json"
 client = bigquery.Client()
 
-LTA_KEY = os.getenv('LTA_API_KEY')
 PROJECT_ID = os.getenv('GOOGLE_CLOUD_PROJECT')
-DATASET_ID = 'sg_transport'
-TABLE_ID = 'bus_arrivals_raw'
+# Use your active AccountKey here [cite: 58]
+LTA_ACCOUNT_KEY = '/Ret98ASSvOCW9XhLdGSTg==' 
 
-def fetch_bus_arrivals(bus_stop_codes):
-    """Fetch real-time arrivals from LTA Datamall"""
+BUS_STOPS = ['44259', '44639']
+
+def run_patrol():
+    # Use the v3 HTTPS URL specified in the Jan 2026 Guide [cite: 25, 243]
     url = "https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival"
-    headers = {'AccountKey': LTA_KEY}
-    all_data = []
+    
+    headers = {
+        'AccountKey': LTA_ACCOUNT_KEY,
+        'accept': 'application/json'
+    }
+    
+    all_rows = []
 
-    for stop_code in bus_stop_codes:
-        print(f"Fetching data for Stop: {stop_code}...")
+    for stop in BUS_STOPS:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking stop: {stop}...")
+        
         try:
-            params = {'BusStopCode': stop_code}
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+            # Use mandatory parameter 'BusStopCode' [cite: 243]
+            response = requests.get(url, headers=headers, params={'BusStopCode': stop}, timeout=10)
             
             if response.status_code == 200:
-                services = response.json().get('Services', [])
-                for svc in services:
-                    # We capture the 'NextBus' details (Arrival time, Load, etc.)
-                    next_bus = svc.get('NextBus', {})
-                    all_data.append({
-                        'timestamp': datetime.now().isoformat(),
-                        'bus_stop_code': stop_code,
-                        'service_no': svc.get('ServiceNo'),
-                        'operator': svc.get('Operator'),
-                        'estimated_arrival': next_bus.get('EstimatedArrival'),
-                        'load': next_bus.get('Load'),
-                        'feature': next_bus.get('Feature'), # e.g., Wheelchair accessible
-                        'type': next_bus.get('Type')        # e.g., Double Decker
-                    })
+                data = response.json()
+                services = data.get('Services', [])
+                
+                # If no services, it might be outside operating hours [cite: 248, 249]
+                if not services:
+                    print(f"   -> No buses in service for stop {stop} right now.")
+                else:
+                    print(f"   -> Success! Found {len(services)} bus services.")
+                
+                for s in services:
+                    s['bus_stop_code'] = stop
+                    s['extracted_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    all_rows.append(s)
             else:
-                print(f"Error {response.status_code} for stop {stop_code}")
+                print(f"   -> Error {response.status_code}. URL: {response.url}")
+                
         except Exception as e:
-            print(f"Connection error: {e}")
+            print(f"   -> Connection failed: {e}")
 
-    return pd.DataFrame(all_data)
-
-# Strategic Monitoring: Yishun-CBD Corridor & Test Stops
-STOPS_TO_MONITOR = ['83139', '59109', '59149', '58009']
+    # Uploading to BigQuery
+    if all_rows:
+        try:
+            # 1. Create a "flat" version of the data
+            # LTA data is 'nested' (NextBus, NextBus2), so we flatten it
+            df = pd.json_normalize(all_rows)
+            
+            # 2. Clean the column names (Lowercase and replace dots with underscores)
+            # BigQuery doesn't like dots (e.g., nextbus.estimatedarrival)
+            df.columns = [c.lower().replace('.', '_') for c in df.columns]
+            
+            table_id = "sg_transport.bus_arrivals_raw"
+            print(f"   -> Uploading {len(df)} rows to BigQuery...")
+            
+            # 3. Use the direct pandas_gbq call
+            import pandas_gbq
+            pandas_gbq.to_gbq(
+                df, 
+                table_id, 
+                project_id=PROJECT_ID, 
+                if_exists='append' # This will now create the table if it's missing
+            )
+            print("   -> [!!!] DATA SUCCESSFULLY LANDED IN BIGQUERY [!!!]")
+            
+        except Exception as e:
+            print(f"   -> BigQuery Error: {e}")
 
 if __name__ == "__main__":
-    # A. Fetch the data
-    df_arrivals = fetch_bus_arrivals(STOPS_TO_MONITOR)
-
-    if not df_arrivals.empty:
-        # B. Define the full table path: project_id.dataset.table
-        destination_table = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-        
-        # C. Upload to BigQuery
-        print(f"Uploading {len(df_arrivals)} rows to BigQuery...")
-        df_arrivals.to_gbq(
-            destination_table=destination_table,
-            project_id=PROJECT_ID,
-            if_exists='append' # This keeps historical records for reliability analysis
-        )
-        print("Ingestion Complete!")
-    else:
-        print("No data fetched. Check your LTA_API_KEY.")
+    print("--- Starting Continuous Patrol (LTA Guide v6.6) ---")
+    while True:
+        run_patrol()
+        # Updated frequency to 30 seconds as per guide 
+        print("--- Waiting 30 seconds ---")
+        time.sleep(30)
